@@ -1,6 +1,11 @@
 services:
   workflow-runner:
+    # Local dev: build the image from this repo.
     build: .
+    # Homeserver / CI deploy: comment out `build:` above and uncomment the
+    # `image:` below to pull the published artifact from GHCR instead.
+    # `docker compose pull && docker compose up -d` will then update in place.
+    # image: ghcr.io/kevinjustin1243/workflowrunner:latest
     # Bind to localhost only — front this with a TLS-terminating reverse proxy.
     # Drop the "127.0.0.1:" if you really mean to expose 8000 on the LAN.
     ports:
