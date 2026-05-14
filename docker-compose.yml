@@ -1,0 +1,70 @@
+services:
+  workflow-runner:
+    build: .
+    # Bind to localhost only — front this with a TLS-terminating reverse proxy.
+    # Drop the "127.0.0.1:" if you really mean to expose 8000 on the LAN.
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # First-boot admin seeding. Token is printed to stdout once if you
+      # don't pre-seed it — capture it from `docker compose logs`.
+      - WR_ADMIN_USERNAME=${WR_ADMIN_USERNAME:-admin}
+      - WR_ADMIN_DISPLAY_NAME=${WR_ADMIN_DISPLAY_NAME:-Admin}
+      - WR_ADMIN_TOKEN=${WR_ADMIN_TOKEN:-}
+      # Per-step timeout fallback (seconds). Each step can still override.
+      - WR_STEP_TIMEOUT=${WR_STEP_TIMEOUT:-1800}
+      # Failure notification sinks (optional). Either or both.
+      - WR_NOTIFY_NTFY_URL=${WR_NOTIFY_NTFY_URL:-}
+      - WR_NOTIFY_DISCORD_WEBHOOK=${WR_NOTIFY_DISCORD_WEBHOOK:-}
+      # External base URL for run links in notifications, e.g. https://wr.home.lan
+      - WR_PUBLIC_BASE_URL=${WR_PUBLIC_BASE_URL:-}
+      # Compose-stack roots used by the homelab workflows. Mount them below if you set them.
+      - COMPOSE_ROOT=${COMPOSE_ROOT:-/srv/compose}
+      - JELLYFIN_COMPOSE_DIR=${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}
+      - JELLYFIN_URL=${JELLYFIN_URL:-http://host.docker.internal:8096}
+      - SHOKO_URL=${SHOKO_URL:-http://host.docker.internal:8111}
+    volumes:
+      # Workflows: edits via the UI persist to the host.
+      - ./server/workflows:/app/server/workflows
+      # State: run history + account credentials survive rebuilds.
+      - ./server/runs.json:/app/server/runs.json
+      - ./server/accounts.json:/app/server/accounts.json
+      # Docker socket so the compose/prune/jellyfin workflows can reach the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount your compose-stack root read-write so the update workflows can `docker compose pull/up`.
+      # Adjust the host path to match your setup.
+      - /srv/compose:/srv/compose
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8000/\", timeout=3).status < 500 else 1)'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "2.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # ── Full host access (uncomment for root-level operations like Gentoo) ────
+    #
+    # If you want the Gentoo upgrade workflow to actually portage-emerge on the
+    # host, this container needs host-level access. The least-bad shape is to
+    # exec into the host via nsenter / chroot rather than reproducing portage
+    # inside the image. Uncomment selectively:
+    #
+    # privileged: true          # grants all Linux capabilities
+    # pid: "host"               # share host PID namespace (ps sees host procs)
+    # network_mode: "host"      # use host network stack (remove "ports" above)
+    #
+    # volumes:
+    #   - /:/host               # entire host filesystem at /host
+    #                           # Commands then prefix with `chroot /host …`
+    #                           # to act on the host. Be deliberate about
+    #                           # which workflows have admin-only edit rights.

@@ -1,0 +1,56 @@
+name: Compose Stacks Update
+glyph: CU
+owner: platform
+tags: [docker, compose, maintenance]
+description: >-
+  Walks every compose stack under $COMPOSE_ROOT (default /srv/compose),
+  pulls latest images, reviews, then recreates with `up -d`. Stacks are
+  any subdirectory containing docker-compose.y(a)ml or compose.y(a)ml.
+# Uncomment to auto-run weekly. Leave off until you've validated by hand.
+# schedule: "0 4 * * 0"
+default_timeout: 3600
+steps:
+  - name: Discover stacks
+    command: |
+      set -e
+      ROOT="${COMPOSE_ROOT:-/srv/compose}"
+      echo "Compose root: $ROOT"
+      if [ ! -d "$ROOT" ]; then
+        echo "ERROR: $ROOT not mounted into the container"; exit 1
+      fi
+      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort
+    timeout: 60
+
+  - name: Pull latest images
+    command: |
+      set +e
+      ROOT="${COMPOSE_ROOT:-/srv/compose}"
+      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort | while read -r f; do
+        d=$(dirname "$f")
+        echo ""; echo "=== Pulling: $d ==="
+        (cd "$d" && docker compose pull) || echo "  pull failed for $d"
+      done
+    timeout: 5400
+
+  - name: Review recreate
+    review: true
+    reviewers: [admin]
+    prompt: |
+      Pulls done. Approve to recreate every stack listed above with `up -d`.
+      Each `up -d` only restarts services whose image digest actually changed,
+      but expect brief blips on any stack that did update.
+
+  - name: Recreate stacks
+    command: |
+      set +e
+      ROOT="${COMPOSE_ROOT:-/srv/compose}"
+      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort | while read -r f; do
+        d=$(dirname "$f")
+        echo ""; echo "=== Up: $d ==="
+        (cd "$d" && docker compose up -d) || echo "  up failed for $d"
+      done
+    timeout: 1800
+
+  - name: Prune dangling images
+    command: docker image prune -f
+    timeout: 300

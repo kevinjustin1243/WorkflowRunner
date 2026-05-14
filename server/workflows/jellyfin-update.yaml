@@ -1,0 +1,59 @@
+name: Jellyfin Update
+glyph: JF
+owner: media
+tags: [media, jellyfin, docker]
+description: >-
+  Pull the latest Jellyfin image, show the digest delta, review, then recreate.
+  Assumes a docker-compose.yml in $JELLYFIN_COMPOSE_DIR with service name "jellyfin".
+default_timeout: 900
+steps:
+  - name: Current image digest
+    command: |
+      DIR="${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}"
+      cd "$DIR" || { echo "Missing $DIR"; exit 1; }
+      docker compose images jellyfin 2>/dev/null || docker compose images
+    timeout: 30
+
+  - name: Pull latest
+    command: |
+      DIR="${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}"
+      cd "$DIR" && docker compose pull
+    timeout: 1800
+
+  - name: New image digest
+    command: |
+      DIR="${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}"
+      cd "$DIR"
+      docker compose images jellyfin 2>/dev/null || docker compose images
+    timeout: 30
+
+  - name: Review recreate
+    review: true
+    reviewers: [admin]
+    prompt: |
+      New image pulled. Approve to recreate the Jellyfin container.
+      Expect ~30s of downtime — any active stream will drop and have to be resumed.
+
+  - name: Recreate container
+    command: |
+      DIR="${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}"
+      cd "$DIR" && docker compose up -d
+    timeout: 300
+
+  - name: Wait for healthy
+    command: |
+      URL="${JELLYFIN_URL:-http://localhost:8096}"
+      for i in $(seq 1 60); do
+        if curl -fsS --max-time 5 "$URL/System/Ping" >/dev/null 2>&1; then
+          echo "Jellyfin responding after ${i}s"; exit 0
+        fi
+        sleep 1
+      done
+      echo "Jellyfin did not respond within 60s — investigate"; exit 1
+    timeout: 90
+
+  - name: Show running version
+    command: |
+      URL="${JELLYFIN_URL:-http://localhost:8096}"
+      curl -fsS --max-time 5 "$URL/System/Info/Public" || true
+    timeout: 15

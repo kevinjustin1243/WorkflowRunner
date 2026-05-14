@@ -1,0 +1,46 @@
+name: Shokofin Status
+glyph: SK
+owner: media
+tags: [media, anime, monitoring]
+description: >-
+  Read-only health check for Shoko Server, Jellyfin, and the Shokofin link.
+  Exits non-zero if anything is unreachable — pair with WR_NOTIFY_* for alerts.
+schedule: "*/30 * * * *"
+default_timeout: 60
+steps:
+  - name: Shoko Server reachable
+    command: |
+      URL="${SHOKO_URL:-http://localhost:8111}"
+      echo "Probing $URL"
+      curl -fsS --max-time 10 "$URL/api/v3/Version" || { echo "Shoko unreachable at $URL"; exit 1; }
+      echo ""
+    timeout: 30
+
+  - name: Shoko init status
+    command: |
+      URL="${SHOKO_URL:-http://localhost:8111}"
+      # Init/Status is one of the few endpoints that doesn't require an API key.
+      curl -fsS --max-time 10 "$URL/api/v3/Init/Status" || echo "Init endpoint unavailable — Shoko may still be starting"
+      echo ""
+    timeout: 30
+
+  - name: Jellyfin reachable
+    command: |
+      URL="${JELLYFIN_URL:-http://localhost:8096}"
+      echo "Probing $URL"
+      curl -fsS --max-time 10 "$URL/System/Ping" || { echo "Jellyfin unreachable at $URL"; exit 1; }
+      echo ""
+    timeout: 30
+
+  - name: Jellyfin Shokofin plugin present
+    command: |
+      URL="${JELLYFIN_URL:-http://localhost:8096}"
+      # Public endpoint — no auth needed for the plugin list summary.
+      out=$(curl -fsS --max-time 10 "$URL/web/configurationpage?name=Shokofin" -o /dev/null -w "%{http_code}" || echo "000")
+      if [ "$out" = "200" ]; then
+        echo "Shokofin plugin endpoint OK"
+      else
+        echo "Shokofin config page returned HTTP $out"
+        # Don't hard-fail here — plugin may still be loaded but lock the config page behind auth.
+      fi
+    timeout: 30

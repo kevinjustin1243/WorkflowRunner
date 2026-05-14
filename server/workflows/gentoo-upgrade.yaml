@@ -1,0 +1,51 @@
+name: Gentoo World Upgrade
+glyph: GU
+owner: platform
+tags: [gentoo, maintenance]
+description: >-
+  Sync portage, preview the @world update, review, then apply. Designed to run
+  via `chroot /host` if the container has the host mounted at /host; otherwise
+  drop the prefix and run natively. Long-running — timeouts are generous.
+# Uncomment to run weekly at 03:00 Sunday. Leave off until you've validated once by hand.
+# schedule: "0 3 * * 0"
+default_timeout: 14400
+steps:
+  - name: emerge --sync
+    command: emerge --sync --quiet
+    timeout: 1800
+
+  - name: Refresh eix database
+    command: command -v eix-update >/dev/null && eix-update || echo "eix not installed — skipping"
+    timeout: 300
+
+  - name: Preview world update
+    command: emerge --pretend --update --deep --newuse --changed-use --with-bdeps=y @world
+    timeout: 600
+
+  - name: Show portage news
+    command: eselect news list new || true
+    timeout: 60
+
+  - name: Review world update
+    review: true
+    reviewers: [admin]
+    prompt: |
+      Inspect the preview above. Approve to run the real upgrade with
+      --keep-going --quiet-build. Rejection aborts the run cleanly.
+      Heads-up: large kernel/toolchain bumps may take hours.
+
+  - name: Apply world update
+    command: emerge --update --deep --newuse --changed-use --with-bdeps=y --keep-going --quiet-build @world
+    timeout: 21600  # 6h ceiling
+
+  - name: Depclean (preview only — safe)
+    command: emerge --pretend --depclean
+    timeout: 600
+
+  - name: revdep-rebuild check
+    command: command -v revdep-rebuild >/dev/null && revdep-rebuild -p || echo "revdep-rebuild not installed — skipping"
+    timeout: 900
+
+  - name: Mark news read
+    command: eselect news read new || true
+    timeout: 60

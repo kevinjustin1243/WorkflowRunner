@@ -1,0 +1,7 @@
+node_modules
+venv
+__pycache__
+.DS_Store
+server/runs.json
+server/accounts.json
+.env

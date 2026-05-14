@@ -1,0 +1,12 @@
+name: Hello World
+glyph: HW
+owner: platform
+tags: [example]
+description: Tiny example workflow — useful for smoke testing the runner itself.
+steps:
+  - name: Greet
+    command: echo "Hello, Workflow Runner!"
+  - name: Show time
+    command: date
+  - name: Count to five
+    command: for i in 1 2 3 4 5; do echo "Count $i"; sleep 0.3; done

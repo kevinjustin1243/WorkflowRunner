@@ -1,0 +1,43 @@
+name: Docker Prune
+glyph: DP
+owner: platform
+tags: [docker, maintenance]
+description: >-
+  Inspect Docker disk usage, then reclaim space with a gated `system prune`.
+  The volume sweep is opt-in inside the review step — read carefully.
+default_timeout: 600
+steps:
+  - name: Disk usage (verbose)
+    command: docker system df -v
+    timeout: 60
+
+  - name: Dangling images
+    command: docker images --filter "dangling=true"
+    timeout: 30
+
+  - name: Stopped containers
+    command: docker ps -a --filter "status=exited" --filter "status=created" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+    timeout: 30
+
+  - name: Unused volumes
+    command: docker volume ls --filter "dangling=true"
+    timeout: 30
+
+  - name: Review prune
+    review: true
+    reviewers: [admin]
+    prompt: |
+      Approve to run `docker system prune -af --volumes`. This removes:
+        - every stopped container
+        - every network not in use
+        - every dangling image, AND every image not referenced by a container
+        - every UNUSED VOLUME (data loss if any of those stacks are merely stopped)
+      Reject if the volume list above contains anything you might bring back.
+
+  - name: Prune (images, containers, networks, volumes)
+    command: docker system prune -af --volumes
+    timeout: 900
+
+  - name: Final disk usage
+    command: docker system df
+    timeout: 30

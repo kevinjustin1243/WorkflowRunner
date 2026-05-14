@@ -1,0 +1,15 @@
+name: System Health Check
+glyph: SC
+owner: platform
+tags: [hourly, ops]
+description: Snapshot of OS, runtimes, disk and processes. Read-only — no reviews needed.
+schedule: "0 * * * *"
+steps:
+  - name: OS info
+    command: uname -a
+  - name: Runtime versions
+    command: python3 --version && (node --version 2>/dev/null || echo "node not installed")
+  - name: Disk usage
+    command: df -h /
+  - name: Top processes
+    command: ps aux | head -8
