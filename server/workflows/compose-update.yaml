@@ -6,30 +6,46 @@ description: >-
   Walks every compose stack under $COMPOSE_ROOT (default /srv/compose),
   pulls latest images, reviews, then recreates with `up -d`. Stacks are
   any subdirectory containing docker-compose.y(a)ml or compose.y(a)ml.
+  All commands run inside `chroot /host` so the container uses the host's
+  docker CLI/socket and sees the real /srv/compose tree (requires
+  `volumes: [/:/host]` and at minimum `privileged: true` + `pid: host` in
+  docker-compose.yml). Each step uses `bash -lc` so profile PATH/env is
+  in place inside the chroot.
 # Uncomment to auto-run weekly. Leave off until you've validated by hand.
 # schedule: "0 4 * * 0"
 default_timeout: 3600
 steps:
+  - name: Prepare host chroot (bind /proc /sys /dev /run)
+    command: |
+      for d in proc sys dev run; do
+        mountpoint -q /host/$d || mount --rbind /$d /host/$d
+      done
+    timeout: 60
+
   - name: Discover stacks
     command: |
-      set -e
-      ROOT="${COMPOSE_ROOT:-/srv/compose}"
-      echo "Compose root: $ROOT"
-      if [ ! -d "$ROOT" ]; then
-        echo "ERROR: $ROOT not mounted into the container"; exit 1
-      fi
-      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort
+      chroot /host /bin/bash -lc '
+        set -e
+        ROOT="${COMPOSE_ROOT:-/srv/compose}"
+        echo "Compose root: $ROOT"
+        if [ ! -d "$ROOT" ]; then
+          echo "ERROR: $ROOT does not exist on host"; exit 1
+        fi
+        find "$ROOT" -maxdepth 2 \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) | sort
+      '
     timeout: 60
 
   - name: Pull latest images
     command: |
-      set +e
-      ROOT="${COMPOSE_ROOT:-/srv/compose}"
-      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort | while read -r f; do
-        d=$(dirname "$f")
-        echo ""; echo "=== Pulling: $d ==="
-        (cd "$d" && docker compose pull) || echo "  pull failed for $d"
-      done
+      chroot /host /bin/bash -lc '
+        set +e
+        ROOT="${COMPOSE_ROOT:-/srv/compose}"
+        find "$ROOT" -maxdepth 2 \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) | sort | while read -r f; do
+          d=$(dirname "$f")
+          echo ""; echo "=== Pulling: $d ==="
+          (cd "$d" && docker compose pull) || echo "  pull failed for $d"
+        done
+      '
     timeout: 5400
 
   - name: Review recreate
@@ -42,15 +58,24 @@ steps:
 
   - name: Recreate stacks
     command: |
-      set +e
-      ROOT="${COMPOSE_ROOT:-/srv/compose}"
-      find "$ROOT" -maxdepth 2 \( -name 'docker-compose.yml' -o -name 'docker-compose.yaml' -o -name 'compose.yml' -o -name 'compose.yaml' \) | sort | while read -r f; do
-        d=$(dirname "$f")
-        echo ""; echo "=== Up: $d ==="
-        (cd "$d" && docker compose up -d) || echo "  up failed for $d"
-      done
+      chroot /host /bin/bash -lc '
+        set +e
+        ROOT="${COMPOSE_ROOT:-/srv/compose}"
+        find "$ROOT" -maxdepth 2 \( -name docker-compose.yml -o -name docker-compose.yaml -o -name compose.yml -o -name compose.yaml \) | sort | while read -r f; do
+          d=$(dirname "$f")
+          echo ""; echo "=== Up: $d ==="
+          (cd "$d" && docker compose up -d) || echo "  up failed for $d"
+        done
+      '
     timeout: 1800
 
   - name: Prune dangling images
-    command: docker image prune -f
+    command: chroot /host /bin/bash -lc 'docker image prune -f'
     timeout: 300
+
+  - name: Teardown host chroot binds
+    command: |
+      for d in run dev sys proc; do
+        mountpoint -q /host/$d && umount -lR /host/$d || true
+      done
+    timeout: 60

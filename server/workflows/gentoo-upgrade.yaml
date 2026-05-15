@@ -3,27 +3,36 @@ glyph: GU
 owner: platform
 tags: [gentoo, maintenance]
 description: >-
-  Sync portage, preview the @world update, review, then apply. Designed to run
-  via `chroot /host` if the container has the host mounted at /host; otherwise
-  drop the prefix and run natively. Long-running — timeouts are generous.
-# Uncomment to run weekly at 03:00 Sunday. Leave off until you've validated once by hand.
+  Sync portage, preview the @world update, review, then apply.
+  All commands run inside `chroot /host` so the container manipulates the
+  real host system (requires `volumes: [/:/host]` and at minimum `privileged: true`
+  + `pid: host` in docker-compose.yml). Each step uses `bash -lc` so profile
+  PATH/env is in place inside the chroot.
+# Uncomment to run weekly at 03:00 Sunday. Validate by hand first.
 # schedule: "0 3 * * 0"
 default_timeout: 14400
 steps:
+  - name: Prepare host chroot (bind /proc /sys /dev /run)
+    command: |
+      for d in proc sys dev run; do
+        mountpoint -q /host/$d || mount --rbind /$d /host/$d
+      done
+    timeout: 60
+
   - name: emerge --sync
-    command: emerge --sync --quiet
+    command: chroot /host /bin/bash -lc 'emerge --sync --quiet'
     timeout: 1800
 
   - name: Refresh eix database
-    command: command -v eix-update >/dev/null && eix-update || echo "eix not installed — skipping"
+    command: chroot /host /bin/bash -lc 'command -v eix-update >/dev/null && eix-update || echo "eix not installed — skipping"'
     timeout: 300
 
   - name: Preview world update
-    command: emerge --pretend --update --deep --newuse --changed-use --with-bdeps=y @world
+    command: chroot /host /bin/bash -lc 'emerge --pretend --update --deep --newuse --changed-use --with-bdeps=y @world'
     timeout: 600
 
   - name: Show portage news
-    command: eselect news list new || true
+    command: chroot /host /bin/bash -lc 'eselect news list new || true'
     timeout: 60
 
   - name: Review world update
@@ -35,17 +44,24 @@ steps:
       Heads-up: large kernel/toolchain bumps may take hours.
 
   - name: Apply world update
-    command: emerge --update --deep --newuse --changed-use --with-bdeps=y --keep-going --quiet-build @world
+    command: chroot /host /bin/bash -lc 'emerge --update --deep --newuse --changed-use --with-bdeps=y --keep-going --quiet-build @world'
     timeout: 21600  # 6h ceiling
 
   - name: Depclean (preview only — safe)
-    command: emerge --pretend --depclean
+    command: chroot /host /bin/bash -lc 'emerge --pretend --depclean'
     timeout: 600
 
   - name: revdep-rebuild check
-    command: command -v revdep-rebuild >/dev/null && revdep-rebuild -p || echo "revdep-rebuild not installed — skipping"
+    command: chroot /host /bin/bash -lc 'command -v revdep-rebuild >/dev/null && revdep-rebuild -p || echo "revdep-rebuild not installed — skipping"'
     timeout: 900
 
   - name: Mark news read
-    command: eselect news read new || true
+    command: chroot /host /bin/bash -lc 'eselect news read new || true'
+    timeout: 60
+
+  - name: Teardown host chroot binds
+    command: |
+      for d in run dev sys proc; do
+        mountpoint -q /host/$d && umount -lR /host/$d || true
+      done
     timeout: 60
