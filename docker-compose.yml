@@ -28,17 +28,24 @@ services:
       - JELLYFIN_COMPOSE_DIR=${JELLYFIN_COMPOSE_DIR:-/srv/compose/jellyfin}
       - JELLYFIN_URL=${JELLYFIN_URL:-http://host.docker.internal:8096}
       - SHOKO_URL=${SHOKO_URL:-http://host.docker.internal:8111}
+      # Postgres is the source of truth for accounts/runs/workflows; the
+      # mounts below are read on first boot only (empty-table migration).
+      - DATABASE_URL=postgresql://workflowrunner:${POSTGRES_PASSWORD:-changeme}@postgres:5432/workflowrunner
     volumes:
-      # Workflows: edits via the UI persist to the host.
-      - ./server/workflows:/app/server/workflows
-      # State: run history + account credentials survive rebuilds.
-      - ./server/runs.json:/app/server/runs.json
-      - ./server/accounts.json:/app/server/accounts.json
+      # First-boot migration sources. After the import they're ignored — the
+      # `workflows` / `accounts` / `runs` Postgres tables are authoritative.
+      # Mount read-only so a stray editor doesn't desync from the DB.
+      - ./server/workflows:/app/server/workflows:ro
+      - ./server/runs.json:/app/server/runs.json:ro
+      - ./server/accounts.json:/app/server/accounts.json:ro
       # Docker socket so the compose/prune/jellyfin workflows can reach the host daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount your compose-stack root read-write so the update workflows can `docker compose pull/up`.
       # Adjust the host path to match your setup.
       - /srv/compose:/srv/compose
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8000/\", timeout=3).status < 500 else 1)'"]
@@ -73,3 +80,124 @@ services:
     #                           # Commands then prefix with `chroot /host …`
     #                           # to act on the host. Be deliberate about
     #                           # which workflows have admin-only edit rights.
+
+  # ── Postgres: source of truth for accounts/runs/workflows + Service A requests
+  # Single shared database; each service ensures its own tables on startup
+  # (idempotent CREATE TABLE IF NOT EXISTS). The runner does a one-shot
+  # import from accounts.json / runs.json / server/workflows/*.yaml on the
+  # first boot against an empty schema.
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: workflowrunner
+      POSTGRES_USER: workflowrunner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Not exposed on the host by default — only services on the compose
+    # network reach it. Uncomment for psql access from the dev box.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workflowrunner -d workflowrunner"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Async request → Kafka → run pipeline ──────────────────────────────────
+  # Service A (request-service) accepts POST /request from upstream callers,
+  # publishes to the workflow.requests topic, and returns a requestId.
+  # Service B (listener-service) consumes that topic and POSTs to the runner's
+  # /hooks/workflow/{file} endpoint using each workflow's webhook_token.
+  # Redpanda is Kafka-API compatible and runs single-node in this stack.
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      # Internal listener (9092) stays cluster-only; external listener exposes
+      # 19092 on the host for rpk / kcat from the dev box. Drop this line in
+      # production — only the in-compose services should talk to Kafka.
+      - "127.0.0.1:19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health 2>&1 | grep -E 'Healthy:.*true' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  request-service:
+    build: ./services/request_service
+    ports:
+      - "127.0.0.1:8100:8100"
+    environment:
+      - KAFKA_BOOTSTRAP=redpanda:9092
+      - KAFKA_TOPIC=${WORKFLOW_TOPIC:-workflow.requests}
+      # If set, POST /request requires header X-Service-Token: <value>.
+      # Unset = open (development); set for any externally-reachable deploy.
+      - REQUEST_SERVICE_TOKEN=${REQUEST_SERVICE_TOKEN:-}
+      - DATABASE_URL=postgresql://workflowrunner:${POSTGRES_PASSWORD:-changeme}@postgres:5432/workflowrunner
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  listener-service:
+    build: ./services/listener_service
+    environment:
+      - KAFKA_BOOTSTRAP=redpanda:9092
+      - KAFKA_TOPIC=${WORKFLOW_TOPIC:-workflow.requests}
+      - KAFKA_GROUP=workflow-listener
+      - WR_BASE_URL=http://workflow-runner:8000
+      # Listener reads webhook_token straight from the shared workflows table
+      # — no YAML mount required.
+      - DATABASE_URL=postgresql://workflowrunner:${POSTGRES_PASSWORD:-changeme}@postgres:5432/workflowrunner
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      workflow-runner:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres-data:

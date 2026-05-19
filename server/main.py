@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
+import asyncpg
 import yaml
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -26,10 +27,19 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
+# Filesystem paths are kept only as one-shot migration sources on first boot —
+# if the corresponding DB tables are empty and these files exist, their
+# contents are imported into Postgres. After that the DB is authoritative;
+# edits to the files on disk are ignored.
 WORKFLOWS_DIR = Path(__file__).parent / "workflows"
 CLIENT_DIST = Path(__file__).parent.parent / "client" / "dist"
 RUNS_FILE = Path(__file__).parent / "runs.json"
 ACCOUNTS_FILE = Path(__file__).parent / "accounts.json"
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://workflowrunner:changeme@localhost:5432/workflowrunner",
+)
 
 USERNAME_RE = re.compile(r"^[a-z0-9_-]{2,32}$")
 ROLES = {"admin", "member"}
@@ -53,9 +63,141 @@ runs: dict[str, "RunState"] = {}
 scheduler = AsyncIOScheduler()
 
 # username -> {username, display_name, role, token_hash, created_at}
+# Mirror of the `accounts` table; auth lookups hit this dict to stay off the
+# request-path DB. Every mutation must write through both the dict and DB.
 accounts: dict[str, dict] = {}
 # sha256(token) -> username
 _token_index: dict[str, str] = {}
+
+# Postgres connection pool. Set in lifespan; nothing should touch it before.
+pg_pool: Optional[asyncpg.Pool] = None
+
+# Schema is created with IF NOT EXISTS so each boot is idempotent. Workflow
+# content stays as YAML text (the editor speaks YAML); run summaries land in
+# a JSONB column so we don't fan out RunState into many tables.
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS accounts (
+    username     TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    token_hash   TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS accounts_token_hash_idx ON accounts(token_hash);
+
+CREATE TABLE IF NOT EXISTS workflows (
+    filename   TEXT PRIMARY KEY,
+    content    TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id         TEXT PRIMARY KEY,
+    workflow_file  TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    started_at     TEXT NOT NULL,
+    finished_at    TEXT,
+    data           JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runs_started_at_idx ON runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS runs_workflow_file_idx ON runs(workflow_file);
+"""
+
+MAX_PERSISTED_RUNS = 200
+
+
+async def connect_pg() -> asyncpg.Pool:
+    """Connect with a retry loop — Postgres may still be starting on cold compose-up."""
+    last_err: Exception | None = None
+    for attempt in range(1, 31):
+        try:
+            pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+            async with pool.acquire() as c:
+                await c.execute(SCHEMA_SQL)
+            print(f"[db] connected to postgres ({DATABASE_URL.split('@')[-1]})", flush=True)
+            return pool
+        except Exception as e:  # asyncpg raises a small zoo of OSError/PostgresError
+            last_err = e
+            print(f"[db] not ready (attempt {attempt}/30): {e}", flush=True)
+            await asyncio.sleep(2)
+    raise RuntimeError(f"postgres unreachable: {last_err}")
+
+
+async def migrate_from_files_if_empty() -> None:
+    """One-shot import of accounts.json / runs.json / workflows/*.yaml.
+
+    Runs only against an empty table — re-running with data present is a
+    no-op. Lets existing installs upgrade without losing accounts or history.
+    """
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        # Accounts
+        n = await c.fetchval("SELECT COUNT(*) FROM accounts")
+        if n == 0 and ACCOUNTS_FILE.exists():
+            try:
+                data = json.loads(ACCOUNTS_FILE.read_text())
+            except Exception:
+                data = []
+            imported = 0
+            for entry in data:
+                if not isinstance(entry, dict) or "username" not in entry:
+                    continue
+                await c.execute(
+                    """INSERT INTO accounts (username, display_name, role, token_hash, created_at)
+                       VALUES ($1,$2,$3,$4,$5)
+                       ON CONFLICT (username) DO NOTHING""",
+                    entry["username"],
+                    entry.get("display_name", entry["username"]),
+                    entry.get("role", "member"),
+                    entry.get("token_hash", ""),
+                    entry.get("created_at", now_iso()),
+                )
+                imported += 1
+            if imported:
+                print(f"[db] migrated {imported} accounts from {ACCOUNTS_FILE}", flush=True)
+
+        # Workflows
+        n = await c.fetchval("SELECT COUNT(*) FROM workflows")
+        if n == 0 and WORKFLOWS_DIR.exists():
+            imported = 0
+            for f in sorted(WORKFLOWS_DIR.glob("*.yaml")):
+                try:
+                    text = f.read_text()
+                except Exception:
+                    continue
+                await c.execute(
+                    """INSERT INTO workflows (filename, content, updated_at)
+                       VALUES ($1,$2,$3) ON CONFLICT (filename) DO NOTHING""",
+                    f.name, text, now_iso(),
+                )
+                imported += 1
+            if imported:
+                print(f"[db] migrated {imported} workflows from {WORKFLOWS_DIR}", flush=True)
+
+        # Runs
+        n = await c.fetchval("SELECT COUNT(*) FROM runs")
+        if n == 0 and RUNS_FILE.exists():
+            try:
+                data = json.loads(RUNS_FILE.read_text())
+            except Exception:
+                data = []
+            imported = 0
+            for entry in data:
+                if not isinstance(entry, dict) or "run_id" not in entry:
+                    continue
+                await c.execute(
+                    """INSERT INTO runs (run_id, workflow_file, status, started_at, finished_at, data)
+                       VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+                       ON CONFLICT (run_id) DO NOTHING""",
+                    entry["run_id"], entry.get("workflow_file", ""),
+                    entry.get("status", "done"),
+                    entry.get("started_at", now_iso()),
+                    entry.get("finished_at"),
+                    json.dumps(entry),
+                )
+                imported += 1
+            if imported:
+                print(f"[db] migrated {imported} runs from {RUNS_FILE}", flush=True)
 
 
 # ── Account helpers ──────────────────────────────────────────────────────────
@@ -87,31 +229,44 @@ def _make_account(username: str, display_name: str, role: str, token: str) -> di
     }
 
 
-def save_accounts() -> None:
-    try:
-        ACCOUNTS_FILE.write_text(json.dumps(list(accounts.values()), indent=2))
-    except Exception:
-        pass
+async def _persist_account(username: str) -> None:
+    """Upsert the in-memory `accounts[username]` row into Postgres."""
+    a = accounts[username]
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        await c.execute(
+            """INSERT INTO accounts (username, display_name, role, token_hash, created_at)
+               VALUES ($1,$2,$3,$4,$5)
+               ON CONFLICT (username) DO UPDATE SET
+                 display_name = EXCLUDED.display_name,
+                 role         = EXCLUDED.role,
+                 token_hash   = EXCLUDED.token_hash""",
+            a["username"], a["display_name"], a["role"], a["token_hash"], a["created_at"],
+        )
 
 
-def load_accounts() -> None:
+async def _delete_account_row(username: str) -> None:
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        await c.execute("DELETE FROM accounts WHERE username=$1", username)
+
+
+async def load_accounts() -> None:
+    """Hydrate the in-memory `accounts` dict + `_token_index` from Postgres."""
     accounts.clear()
     _token_index.clear()
-    if not ACCOUNTS_FILE.exists():
-        return
-    try:
-        data = json.loads(ACCOUNTS_FILE.read_text())
-    except Exception:
-        return
-    for entry in data:
-        if not isinstance(entry, dict) or "username" not in entry:
-            continue
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        rows = await c.fetch("SELECT username, display_name, role, token_hash, created_at FROM accounts")
+    for r in rows:
+        entry = dict(r)
         accounts[entry["username"]] = entry
         if entry.get("token_hash"):
             _token_index[entry["token_hash"]] = entry["username"]
 
 
 def _register_token(username: str, token: str) -> None:
+    """In-memory token rotation. Callers must follow up with `_persist_account`."""
     acct = accounts[username]
     old = acct.get("token_hash")
     if old and _token_index.get(old) == username:
@@ -120,7 +275,7 @@ def _register_token(username: str, token: str) -> None:
     _token_index[acct["token_hash"]] = username
 
 
-def seed_admin_if_empty() -> None:
+async def seed_admin_if_empty() -> None:
     if accounts:
         return
     username = os.environ.get("WR_ADMIN_USERNAME", "admin").strip().lower() or "admin"
@@ -131,7 +286,7 @@ def seed_admin_if_empty() -> None:
     acct = _make_account(username, display_name, "admin", token)
     accounts[username] = acct
     _token_index[acct["token_hash"]] = username
-    save_accounts()
+    await _persist_account(username)
     banner = "=" * 38
     print(f"\n{banner}")
     print(" WORKFLOW RUNNER · INITIAL ADMIN")
@@ -241,38 +396,60 @@ class RunState:
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 
-def save_runs() -> None:
-    payload = [r.to_summary() for r in runs.values() if r.is_terminal]
-    # Keep the 200 most recent terminal runs
-    payload = payload[-200:]
-    try:
-        RUNS_FILE.write_text(json.dumps(payload, indent=2))
-    except Exception:
-        pass
+async def save_run(state: "RunState") -> None:
+    """Upsert one run into the `runs` table; trim to MAX_PERSISTED_RUNS rows.
+
+    Only meaningful for terminal runs — the in-memory `runs` dict is the
+    source of truth while a run is live (SSE subscribers depend on it). This
+    is called on every state-transitioning endpoint so the DB tracks the
+    final shape of each run.
+    """
+    summary = state.to_summary()
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        await c.execute(
+            """INSERT INTO runs (run_id, workflow_file, status, started_at, finished_at, data)
+               VALUES ($1,$2,$3,$4,$5,$6::jsonb)
+               ON CONFLICT (run_id) DO UPDATE SET
+                 status      = EXCLUDED.status,
+                 finished_at = EXCLUDED.finished_at,
+                 data        = EXCLUDED.data""",
+            state.run_id, state.workflow_file, state.status,
+            state.started_at, state.finished_at, json.dumps(summary),
+        )
+        # Cap retention. Older terminal rows fall off; live ones never get
+        # written until they terminate, so they're naturally exempt.
+        await c.execute(
+            """DELETE FROM runs WHERE run_id IN (
+                   SELECT run_id FROM runs ORDER BY started_at DESC OFFSET $1
+               )""",
+            MAX_PERSISTED_RUNS,
+        )
 
 
-def load_runs() -> None:
-    if not RUNS_FILE.exists():
-        return
-    try:
-        data = json.loads(RUNS_FILE.read_text())
-    except Exception:
-        return
-    dirty = False
+async def load_runs() -> None:
+    """Rehydrate the `runs` dict from Postgres. Mirrors the file-loader's
+    identity-scrub: 'by' values that no longer resolve to a known account
+    collapse to 'system', and comments by deleted accounts are dropped."""
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        rows = await c.fetch(
+            f"SELECT data FROM runs ORDER BY started_at DESC LIMIT {MAX_PERSISTED_RUNS}"
+        )
     known = set(accounts.keys()) | {SCHEDULER_USER, WEBHOOK_USER}
-    for entry in data:
+    dirty_ids: list[str] = []
+    for row in rows:
+        raw = row["data"]
+        entry = json.loads(raw) if isinstance(raw, str) else dict(raw)
         wf = {"name": entry.get("workflow_name"), "steps": entry.get("steps", [])}
         state = RunState.__new__(RunState)
         state.run_id = entry["run_id"]
         state.workflow = wf
         state.workflow_file = entry.get("workflow_file", "")
         raw_by = entry.get("by", "manual")
-        # Anything that isn't a known account (or the scheduler sentinel) collapses
-        # to the generic 'system' bucket so stale identities don't keep
-        # appearing in the UI after an account is deleted.
         if raw_by not in known:
             state.by = "system"
-            dirty = True
+            dirty_ids.append(state.run_id)
         else:
             state.by = raw_by
         state.status = entry["status"]
@@ -284,11 +461,12 @@ def load_runs() -> None:
         state._review_comment = ""
         state._review_by = None
         scrubbed_comments = []
-        for c in entry.get("comments", []) or []:
-            if c.get("by") in known:
-                scrubbed_comments.append(c)
+        for cm in entry.get("comments", []) or []:
+            if cm.get("by") in known:
+                scrubbed_comments.append(cm)
             else:
-                dirty = True
+                if state.run_id not in dirty_ids:
+                    dirty_ids.append(state.run_id)
         state.comments = scrubbed_comments
         state.started_at = entry.get("started_at", now_iso())
         state.finished_at = entry.get("finished_at")
@@ -298,8 +476,59 @@ def load_runs() -> None:
         for log in entry.get("logs", []):
             state._events.append({"type": "step_log", "data": log})
         runs[state.run_id] = state
-    if dirty:
-        save_runs()
+    for rid in dirty_ids:
+        await save_run(runs[rid])
+
+
+# ── Workflow file persistence (DB-backed) ────────────────────────────────────
+
+async def db_get_workflow(filename: str) -> Optional[dict]:
+    """Return parsed YAML for one workflow, or None if missing/invalid."""
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        row = await c.fetchrow("SELECT content FROM workflows WHERE filename=$1", filename)
+    if not row:
+        return None
+    try:
+        return yaml.safe_load(row["content"]) or {}
+    except yaml.YAMLError:
+        return None
+
+
+async def db_get_workflow_content(filename: str) -> Optional[str]:
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        row = await c.fetchrow("SELECT content FROM workflows WHERE filename=$1", filename)
+    return row["content"] if row else None
+
+
+async def db_list_workflows() -> list[dict]:
+    """Return [{filename, content, updated_at}, …] sorted by filename."""
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        rows = await c.fetch(
+            "SELECT filename, content, updated_at FROM workflows ORDER BY filename"
+        )
+    return [dict(r) for r in rows]
+
+
+async def db_upsert_workflow(filename: str, content: str) -> None:
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        await c.execute(
+            """INSERT INTO workflows (filename, content, updated_at)
+               VALUES ($1,$2,$3)
+               ON CONFLICT (filename) DO UPDATE SET
+                 content    = EXCLUDED.content,
+                 updated_at = EXCLUDED.updated_at""",
+            filename, content, now_iso(),
+        )
+
+
+async def db_delete_workflow(filename: str) -> None:
+    assert pg_pool is not None
+    async with pg_pool.acquire() as c:
+        await c.execute("DELETE FROM workflows WHERE filename=$1", filename)
 
 
 # ── Process + notification helpers ────────────────────────────────────────────
@@ -372,23 +601,24 @@ async def _notify_failure(state: "RunState") -> None:
 
 # ── Scheduling helpers ────────────────────────────────────────────────────────
 
-def load_schedules() -> None:
-    if not WORKFLOWS_DIR.exists():
-        return
-    for f in WORKFLOWS_DIR.glob("*.yaml"):
+async def load_schedules() -> None:
+    """Register cron jobs for every workflow in the DB that has a `schedule:`."""
+    for row in await db_list_workflows():
         try:
-            with open(f) as fp:
-                wf = yaml.safe_load(fp)
-            if wf and wf.get("schedule"):
+            wf = yaml.safe_load(row["content"]) or {}
+        except yaml.YAMLError:
+            continue
+        if wf.get("schedule"):
+            try:
                 scheduler.add_job(
                     run_workflow_by_file,
                     CronTrigger.from_crontab(wf["schedule"]),
-                    id=f.name,
+                    id=row["filename"],
                     replace_existing=True,
-                    kwargs={"filename": f.name, "by": "scheduler"},
+                    kwargs={"filename": row["filename"], "by": "scheduler"},
                 )
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 def sync_schedule(filename: str, wf: dict) -> None:
@@ -411,11 +641,9 @@ def sync_schedule(filename: str, wf: dict) -> None:
 
 
 async def run_workflow_by_file(filename: str, by: str = "scheduler") -> None:
-    path = (WORKFLOWS_DIR / filename).resolve()
-    if not path.exists():
+    workflow = await db_get_workflow(filename)
+    if not workflow:
         return
-    with open(path) as f:
-        workflow = yaml.safe_load(f)
     state = RunState(workflow, filename, by=by)
     runs[state.run_id] = state
     await execute_workflow(state)
@@ -425,13 +653,20 @@ async def run_workflow_by_file(filename: str, by: str = "scheduler") -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_accounts()
-    seed_admin_if_empty()
-    load_runs()
-    load_schedules()
+    global pg_pool
+    pg_pool = await connect_pg()
+    await migrate_from_files_if_empty()
+    await load_accounts()
+    await seed_admin_if_empty()
+    await load_runs()
+    await load_schedules()
     scheduler.start()
-    yield
-    scheduler.shutdown(wait=False)
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+        if pg_pool is not None:
+            await pg_pool.close()
 
 
 app = FastAPI(title="Workflow Runner", lifespan=lifespan)
@@ -546,7 +781,7 @@ class CreateAccountRequest(BaseModel):
 
 
 @app.post("/accounts")
-def create_account(body: CreateAccountRequest, _admin: dict = Depends(require_admin)):
+async def create_account(body: CreateAccountRequest, _admin: dict = Depends(require_admin)):
     username = body.username.strip().lower()
     if not USERNAME_RE.match(username):
         raise HTTPException(422, "username must be 2-32 chars, [a-z0-9_-]")
@@ -561,12 +796,12 @@ def create_account(body: CreateAccountRequest, _admin: dict = Depends(require_ad
     acct = _make_account(username, display_name, body.role, token)
     accounts[username] = acct
     _token_index[acct["token_hash"]] = username
-    save_accounts()
+    await _persist_account(username)
     return {**_public_account(acct), "token": token}
 
 
 @app.delete("/accounts/{username}")
-def delete_account(username: str, admin: dict = Depends(require_admin)):
+async def delete_account(username: str, admin: dict = Depends(require_admin)):
     if username not in accounts:
         raise HTTPException(404, "Account not found")
     if username == admin["username"]:
@@ -579,12 +814,12 @@ def delete_account(username: str, admin: dict = Depends(require_admin)):
             raise HTTPException(409, "Cannot delete the last admin")
     acct = accounts.pop(username)
     _token_index.pop(acct.get("token_hash", ""), None)
-    save_accounts()
+    await _delete_account_row(username)
     return {"ok": True}
 
 
 @app.post("/accounts/{username}/rotate-token")
-def rotate_account_token(username: str, request: Request):
+async def rotate_account_token(username: str, request: Request):
     user = current_user(request)
     if user["username"] != username and user["role"] != "admin":
         raise HTTPException(403, "Only admins or the account owner can rotate this token")
@@ -592,27 +827,28 @@ def rotate_account_token(username: str, request: Request):
         raise HTTPException(404, "Account not found")
     token = _gen_token()
     _register_token(username, token)
-    save_accounts()
+    await _persist_account(username)
     return {"username": username, "token": token}
 
 
 # ── Workflow file endpoints ───────────────────────────────────────────────────
 
 @app.get("/workflows")
-def get_workflows(_user: dict = Depends(current_user)):
+async def get_workflows(_user: dict = Depends(current_user)):
     result = []
-    if WORKFLOWS_DIR.exists():
-        for f in sorted(WORKFLOWS_DIR.glob("*.yaml")):
-            with open(f) as fp:
-                wf = yaml.safe_load(fp)
-            if not wf:
-                continue
-            wf["_file"] = f.name
-            job = scheduler.get_job(f.name)
-            if job and job.next_run_time:
-                wf["next_run"] = job.next_run_time.isoformat()
-            wf["stats"] = workflow_stats(f.name)
-            result.append(wf)
+    for row in await db_list_workflows():
+        try:
+            wf = yaml.safe_load(row["content"]) or {}
+        except yaml.YAMLError:
+            continue
+        if not wf:
+            continue
+        wf["_file"] = row["filename"]
+        job = scheduler.get_job(row["filename"])
+        if job and job.next_run_time:
+            wf["next_run"] = job.next_run_time.isoformat()
+        wf["stats"] = workflow_stats(row["filename"])
+        result.append(wf)
     return result
 
 
@@ -621,37 +857,37 @@ class WorkflowContent(BaseModel):
 
 
 @app.get("/workflow/{filename}/content")
-def get_workflow_content(filename: str, _user: dict = Depends(current_user)):
-    path = (WORKFLOWS_DIR / filename).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()) or not path.exists():
+async def get_workflow_content(filename: str, _user: dict = Depends(current_user)):
+    content = await db_get_workflow_content(filename)
+    if content is None:
         raise HTTPException(404, "Workflow not found")
-    return {"content": path.read_text()}
+    return {"content": content}
 
 
 @app.put("/workflow/{filename}")
-def update_workflow(filename: str, body: WorkflowContent, _admin: dict = Depends(require_admin)):
-    path = (WORKFLOWS_DIR / filename).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()) or not path.exists():
+async def update_workflow(filename: str, body: WorkflowContent, _admin: dict = Depends(require_admin)):
+    existing = await db_get_workflow_content(filename)
+    if existing is None:
         raise HTTPException(404, "Workflow not found")
     try:
         wf = yaml.safe_load(body.content)
     except yaml.YAMLError as e:
         raise HTTPException(422, f"Invalid YAML: {e}")
-    path.write_text(body.content)
+    await db_upsert_workflow(filename, body.content)
     sync_schedule(filename, wf or {})
     return {"ok": True}
 
 
 @app.delete("/workflow/{filename}")
-def delete_workflow(filename: str, _admin: dict = Depends(require_admin)):
-    path = (WORKFLOWS_DIR / filename).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()) or not path.exists():
+async def delete_workflow(filename: str, _admin: dict = Depends(require_admin)):
+    existing = await db_get_workflow_content(filename)
+    if existing is None:
         raise HTTPException(404, "Workflow not found")
     try:
         scheduler.remove_job(filename)
     except Exception:
         pass
-    path.unlink()
+    await db_delete_workflow(filename)
     return {"ok": True}
 
 
@@ -661,19 +897,16 @@ class CreateRequest(BaseModel):
 
 
 @app.post("/workflows/create")
-def create_workflow(body: CreateRequest, _admin: dict = Depends(require_admin)):
+async def create_workflow(body: CreateRequest, _admin: dict = Depends(require_admin)):
     if "/" in body.filename or "\\" in body.filename or not body.filename.endswith(".yaml"):
         raise HTTPException(400, "Filename must be a plain .yaml filename with no path separators")
-    path = (WORKFLOWS_DIR / body.filename).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()):
-        raise HTTPException(400, "Invalid path")
-    if path.exists():
+    if await db_get_workflow_content(body.filename) is not None:
         raise HTTPException(409, f"'{body.filename}' already exists")
     try:
         wf = yaml.safe_load(body.content)
     except yaml.YAMLError as e:
         raise HTTPException(422, f"Invalid YAML: {e}")
-    path.write_text(body.content)
+    await db_upsert_workflow(body.filename, body.content)
     sync_schedule(body.filename, wf or {})
     return {"ok": True, "_file": body.filename}
 
@@ -690,11 +923,9 @@ async def start_run(
     background_tasks: BackgroundTasks,
     user: dict = Depends(current_user),
 ):
-    path = (WORKFLOWS_DIR / req.workflow_file).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()) or not path.exists():
+    workflow = await db_get_workflow(req.workflow_file)
+    if not workflow:
         raise HTTPException(404, "Workflow not found")
-    with open(path) as f:
-        workflow = yaml.safe_load(f)
     state = RunState(workflow, req.workflow_file, by=user["username"])
     runs[state.run_id] = state
     background_tasks.add_task(execute_workflow, state)
@@ -715,7 +946,7 @@ async def execute_workflow(state: RunState) -> None:
         state.duration_ms = total
         state.finished_at = now_iso()
         state.emit("workflow_done", {"status": "failed", "duration_ms": total})
-        save_runs()
+        await save_run(state)
         await _notify_failure(state)
 
     default_timeout = state.workflow.get("default_timeout") or DEFAULT_STEP_TIMEOUT
@@ -858,7 +1089,7 @@ async def execute_workflow(state: RunState) -> None:
     state.duration_ms = total
     state.finished_at = now_iso()
     state.emit("workflow_done", {"status": "success", "duration_ms": total})
-    save_runs()
+    await save_run(state)
 
 
 @app.get("/workflow/{run_id}/stream")
@@ -952,7 +1183,7 @@ async def cancel_run(run_id: str, user: dict = Depends(current_user)):
     state._review_by = user["username"]
     state._review_event.set()
     state.emit("workflow_done", {"status": "cancelled", "duration_ms": state.duration_ms or 0})
-    save_runs()
+    await save_run(state)
     return {"ok": True}
 
 
@@ -1066,11 +1297,9 @@ async def webhook_trigger(
     """External-trigger endpoint. Bypasses normal auth; instead, the caller
     must supply a token that matches the workflow's `webhook_token:` field.
     Token can come from `?token=` or the `X-Webhook-Token` header."""
-    path = (WORKFLOWS_DIR / filename).resolve()
-    if not path.is_relative_to(WORKFLOWS_DIR.resolve()) or not path.exists():
+    workflow = await db_get_workflow(filename)
+    if not workflow:
         raise HTTPException(404, "Workflow not found")
-    with open(path) as f:
-        workflow = yaml.safe_load(f) or {}
     expected = workflow.get("webhook_token")
     if not expected:
         raise HTTPException(404, "Workflow does not accept webhooks")
