@@ -32,12 +32,18 @@ services:
       # mounts below are read on first boot only (empty-table migration).
       - DATABASE_URL=postgresql://workflowrunner:${POSTGRES_PASSWORD:-changeme}@postgres:5432/workflowrunner
     volumes:
-      # First-boot migration sources. After the import they're ignored — the
-      # `workflows` / `accounts` / `runs` Postgres tables are authoritative.
-      # Mount read-only so a stray editor doesn't desync from the DB.
+      # First-boot migration source for the `workflows` table. After the
+      # initial import this is ignored — the DB is authoritative. Mounted
+      # read-only so a stray editor can't desync from the DB.
       - ./server/workflows:/app/server/workflows:ro
-      - ./server/runs.json:/app/server/runs.json:ro
-      - ./server/accounts.json:/app/server/accounts.json:ro
+      # Upgrade-only: uncomment these if you're migrating from a pre-Postgres
+      # install and want the runner to import your existing accounts.json /
+      # runs.json into the DB on first boot. The files must exist on the host
+      # before `docker compose up` or Docker will silently create them as
+      # directories. Fresh installs don't need them — accounts are seeded and
+      # runs start empty.
+      # - ./server/accounts.json:/app/server/accounts.json:ro
+      # - ./server/runs.json:/app/server/runs.json:ro
       # Docker socket so the compose/prune/jellyfin workflows can reach the host daemon.
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount your compose-stack root read-write so the update workflows can `docker compose pull/up`.
